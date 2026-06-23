@@ -3,7 +3,7 @@ services:
     name: aerocrop-backend
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --timeout 120 --workers 1
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 120
     envVars:
       - key: GEE_SERVICE_ACCOUNT_JSON
         sync: false
