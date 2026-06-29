@@ -1,5 +1,6 @@
 import os, json, datetime
 import ee
+import urllib.request
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -10,6 +11,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── Global Progress Tracker ───────────────────────────────────────────────────
+analysis_progress = {
+    "status": "idle",
+    "progress": 0,
+    "message": "Waiting...",
+    "current_step": ""
+}
+
+def update_progress(progress, message, step):
+    global analysis_progress
+    analysis_progress = {
+        "status": "running" if progress < 100 else "completed",
+        "progress": progress,
+        "message": message,
+        "current_step": step
+    }
 
 # ── GEE initialisation ────────────────────────────────────────────────────────
 def init_gee():
@@ -637,7 +655,7 @@ def classify_crop(dates, series):
     peak      = max(smoothed)
     peak_idx  = smoothed.index(peak)
     from datetime import datetime as dt
-    d0         = dt.strptime(dedup_dates[0],       '%Y-%m-%d')
+    d0         = dt.strptime(dedup_dates[0],        '%Y-%m-%d')
     d_last     = dt.strptime(dedup_dates[-1],       '%Y-%m-%d')
     d_peak     = dt.strptime(dedup_dates[peak_idx], '%Y-%m-%d')
     total_span = (d_last - d0).days
@@ -684,67 +702,6 @@ def compute_all_suitabilities(sand_v, clay_v, ph_v, whc_v, drain_v, smi_v):
         for crop, p in CROP_SOIL_PARAMS.items()
     }
 
-def compute_advisory(ndvi_arr, smi_arr):
-    statuses = [classify_tile(n, s) for n, s in zip(ndvi_arr, smi_arr)]
-    known    = [s for s in statuses if s != 'pending']
-    total    = len(known)
-    if total == 0:
-        return {'head':'Awaiting data','depth':'—','duration':'—','reason':'No valid tiles'}, statuses
-    severe   = known.count('severe')
-    moderate = known.count('moderate')
-    if severe / total > 0.15:
-        adv = {'head':'Irrigate within 24 hours','depth':'25–30 mm','duration':'6–8 hrs',
-               'reason':f'{severe} of {total} zones severely stressed'}
-    elif moderate / total > 0.25 or severe > 0:
-        adv = {'head':'Irrigate within 48 hours','depth':'15–20 mm','duration':'4–5 hrs',
-               'reason':f'{moderate} zones moderate, {severe} severe (of {total})'}
-    else:
-        adv = {'head':'No irrigation needed','depth':'0 mm','duration':'—',
-               'reason':f'Soil moisture adequate across all {total} zones'}
-    return adv, statuses
-
-# ── Crop phenology classifier ─────────────────────────────────────────────────
-def classify_crop(dates, series):
-    if not series or len(series) < 4:
-        return {'crop':'Unknown','confidence':0,'auto':False}
-    # Deduplicate same-date readings (overlapping satellite passes)
-    by_date = {}
-    for d, v in zip(dates, series):
-        by_date.setdefault(d, []).append(v)
-    dedup_dates  = sorted(by_date.keys())
-    dedup_series = [sum(by_date[d]) / len(by_date[d]) for d in dedup_dates]
-    # 3-point moving average
-    smoothed = []
-    for i in range(len(dedup_series)):
-        lo, hi = max(0, i - 1), min(len(dedup_series), i + 2)
-        smoothed.append(sum(dedup_series[lo:hi]) / (hi - lo))
-    peak      = max(smoothed)
-    peak_idx  = smoothed.index(peak)
-    from datetime import datetime as dt
-    d0         = dt.strptime(dedup_dates[0],          '%Y-%m-%d')
-    d_last     = dt.strptime(dedup_dates[-1],          '%Y-%m-%d')
-    d_peak     = dt.strptime(dedup_dates[peak_idx],    '%Y-%m-%d')
-    total_span = (d_last - d0).days
-    days_since = (d_last - d_peak).days
-    end_val    = sum(smoothed[-3:]) / min(3, len(smoothed))
-    fall_rate  = (peak - end_val) / days_since if days_since > 0 else 0
-    signatures = {
-        'Paddy':     {'peak':0.75, 'cycleDays':135, 'fallRate':0.006},
-        'Ragi':      {'peak':0.55, 'cycleDays':110, 'fallRate':0.004},
-        'Sugarcane': {'peak':0.70, 'cycleDays':330, 'fallRate':0.001},
-        'Maize':     {'peak':0.65, 'cycleDays':100, 'fallRate':0.007},
-    }
-    best, best_score = None, float('inf')
-    for crop, sig in signatures.items():
-        score = (abs(peak - sig['peak']) +
-                 abs(total_span - sig['cycleDays']) / 100 +
-                 abs(fall_rate - sig['fallRate']) * 50)
-        if score < best_score:
-            best_score, best = score, crop
-    confidence = round(max(40, min(95, 100 - best_score * 30)))
-    return {'crop':best, 'confidence':confidence, 'auto':True,
-            'peak':round(peak, 3), 'spanDays':total_span}
-
 # ── Main analysis endpoint ────────────────────────────────────────────────────
 
 @app.get("/analyze")
@@ -754,7 +711,11 @@ def analyze(lat: float, lon: float, radius_m: int = 750):
     Returns NDVI + SMI tiles, irrigation advisory, and crop classification.
     Typical response time: 15–25 seconds.
     """
+    # Reset progress at the very start of a new request so it never stays stuck
+    update_progress(0, "Waiting...", "idle")
+    
     try:
+        update_progress(5, "Connecting to Google Earth Engine...", "gee_connect")
         today        = datetime.date.today()
         one_year_ago = today.replace(year=today.year - 1)
         thirty_ago   = today - datetime.timedelta(days=30)
@@ -765,24 +726,29 @@ def analyze(lat: float, lon: float, radius_m: int = 750):
         aoi    = center.buffer(radius_m).bounds()
 
         # ── Sentinel-2 NDVI ──────────────────────────────────────────────────
-        s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+        update_progress(15, "Loading Sentinel-2 imagery...", "sentinel2")
+        s2_collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                 .filterBounds(aoi)
                 .filterDate(one_year_ago.isoformat(), today.isoformat())
-                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
-                .map(mask_s2_clouds))
-        if s2.size().getInfo() < 3:
-            s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
+        
+        if s2_collection.size().getInfo() < 3:
+            s2_collection = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                     .filterBounds(aoi)
                     .filterDate(one_year_ago.isoformat(), today.isoformat())
-                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60))
-                    .map(mask_s2_clouds))
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 60)))
+        
+        update_progress(25, "Applying cloud mask...", "cloud_mask")
+        s2 = s2_collection.map(mask_s2_clouds)
 
+        update_progress(40, "Calculating NDVI...", "ndvi")
         ndvi_img = (s2.median()
                       .normalizedDifference(['B8', 'B4'])
                       .rename('NDVI')
                       .clip(aoi))
 
         # ── Sentinel-1 SAR soil moisture index ───────────────────────────────
+        update_progress(55, "Loading Sentinel-1 SAR...", "sentinel1")
         s1_all = (ee.ImageCollection('COPERNICUS/S1_GRD')
                     .filterBounds(aoi)
                     .filterDate(one_year_ago.isoformat(), today.isoformat())
@@ -797,6 +763,8 @@ def analyze(lat: float, lon: float, radius_m: int = 750):
         if vv_recent.size().getInfo() == 0:
             vv_recent = s1_all.filterDate(ninety_ago.isoformat(), today.isoformat())
         vv_current = vv_recent.median().rename('VV_current')
+        
+        update_progress(70, "Calculating Soil Moisture...", "smi")
         smi = (vv_current.subtract(vv_dry)
                          .divide(vv_wet.subtract(vv_dry))
                          .clamp(0, 1).rename('SMI').clip(aoi))
@@ -819,6 +787,8 @@ def analyze(lat: float, lon: float, radius_m: int = 750):
                 grid.append(ee.Feature(
                     ee.Geometry.Rectangle([lo, la0, lo + lon_step, la0 + lat_step]),
                     {'tile_row': r, 'tile_col': c}))
+        
+        # NOTE: reduceRegions takes time, so it runs here under the SMI/Grid processing timeframe.
         tile_values = combined.reduceRegions(
             collection=ee.FeatureCollection(grid),
             reducer=ee.Reducer.mean(), scale=10)
@@ -848,9 +818,13 @@ def analyze(lat: float, lon: float, radius_m: int = 750):
         crop_ndvi   = series_fc.aggregate_array('ndvi').getInfo()
 
         # ── Compute results ───────────────────────────────────────────────────
-        advisory, statuses = compute_advisory(ndvi_arr, smi_arr)
+        update_progress(82, "Running Crop Classification...", "crop_classifier")
         crop_result        = classify_crop(crop_dates, crop_ndvi)
+        
+        update_progress(92, "Generating Irrigation Advisory...", "advisory")
+        advisory, statuses = compute_advisory(ndvi_arr, smi_arr)
 
+        update_progress(100, "Analysis Complete", "completed")
         return {
             "status":   "success",
             "lat": lat, "lon": lon, "radius_m": radius_m,
@@ -864,6 +838,7 @@ def analyze(lat: float, lon: float, radius_m: int = 750):
         }
 
     except Exception as e:
+        update_progress(0, f"Analysis Failed: {str(e)}", "error")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
 
 
@@ -1228,5 +1203,10 @@ def health():
         "status": "ok",
         "message": "AeroCrop backend is running",
         "crops_supported": len(CROP_CALENDARS),
-        "endpoints": ["/analyze", "/soil-intelligence", "/weather", "/crop-calendar", "/crops/list", "/administrative", "/health"]
+        "endpoints": ["/analyze", "/soil-intelligence", "/weather", "/crop-calendar", "/crops/list", "/administrative", "/health", "/analysis-progress"]
     }
+
+# ── Progress API ──────────────────────────────────────────────────────────────
+@app.get("/analysis-progress")
+def analysis_progress_api():
+    return analysis_progress
